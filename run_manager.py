@@ -4,8 +4,10 @@ import numpy as np
 import imdb
 import sys
 import logging
-from pandarallel import pandarallel
 from tqdm import tqdm
+import multiprocessing as mp
+from functools import reduce
+
 
 from uri_extractor import UriExtractor
 from datetime import date, datetime, timedelta
@@ -17,7 +19,7 @@ POINTS_REGEX = r'(?P<points>\(\d{1,10} \w+ points\))'
 logging.basicConfig(filename="log2.txt", level=logging.WARNING)
 
 urls = []
-begin_date = date(2020, 11, 4)
+begin_date = date(2022, 11, 4)
 end_date = date.today()
 
 
@@ -31,12 +33,8 @@ for single_date in daterange(begin_date, end_date):
 
 
 def extract_tables(url_dict):
-    cols = ['name', 'country', 'rating', 'date', 'points', 'url', 'genres']
-    genres = [f'genre {i}' for i in range(1, 11)]
-    cols = cols + genres
+    cols = ['name', 'country', 'rating', 'date', 'points', 'url']
     df_dict = {'Movies': pd.DataFrame(columns=cols), 'TV': pd.DataFrame(columns=cols), 'Kids': pd.DataFrame(columns=cols)}
-    pandarallel.initialize(progress_bar=False)
-    ia = imdb.Cinemagoer()
     for url, html in tqdm(url_dict.items()):
         soup = bs4.BeautifulSoup(html, features="lxml")
         h4_titles = soup.find_all("h4")
@@ -62,11 +60,6 @@ def extract_tables(url_dict):
                         else:
                             temp['points'] = np.nan
                         temp['name'] = temp.name.str.strip()
-                        temp['genres'] = temp['name'].apply(find_movie_genre, args=(df_dict, ia,))
-                        temp_genre = temp.genres.str.split(',', expand=True)
-                        for i in range(len(temp_genre.columns), len(genres)):
-                            temp_genre[i] = None
-                        temp[genres] = temp_genre
                         temp = temp[cols]
                         df_dict[dftype] = pd.concat([df_dict.get(dftype), temp], ignore_index=True)
     df_dict['Movies'].to_csv(f'dataset_top_netflix_movies_{begin_date}_{end_date}.csv', sep=',', header=True, index=False, columns=cols)
@@ -77,38 +70,36 @@ def extract_tables(url_dict):
     return df_dict
 
 
-def find_movie_genre(movie_name, df_dict, ia):
-    existing = check_existing(movie_name, df_dict)
-    if existing:
-        return ','.join(existing)
+def find_movie_genre(movie_name):
+    ia = imdb.Cinemagoer()
     movies = ia.search_movie(movie_name)
     retry = 0
     while not movies and retry < 10:
         movies = ia.search_movie(movie_name)
         retry += 1
     if not movies:
-        return ''
+        return {movie_name: ''}
     try:
         movie = [mov for mov in movies if movie_name.lower() == mov['title'].lower()]
         if not movie:
             try:
                 movie = [mov for mov in movies if movie_name.lower() in list(map(str.lower, mov.get('akas', "")))][0]
             except Exception as ke:
-                # logging.warning(f"Genre matching got following exception but continued:\n {ke}")
+                logging.warning(f"Genre matching got following exception but continued:\n {ke}")
                 try:
                     movie = [mov for mov in movies if movie_name.lower() in mov['title'].lower()][0]
                 except Exception as e:
-                    # logging.warning(f"Genre matching got following exception but continued:\n {e}")
+                    logging.warning(f"Genre matching got following exception but continued:\n {e}")
                     movie = choose_by_words(movie_name, movies)
         else:
             movie = movie[0]
         movie = ia.get_movie(movie.movieID)
-        return ','.join(movie['genres'])
+        return {movie_name: ','.join(movie['genres'])}
     except Exception as e:
-        # t, v, tb = sys.exc_info()
-        # logging.debug(f"movie name from table: {movie_name.lower()}\n movies names from title: {[mov['title'].lower() for mov in movies]}")
-        # logging.warning(f"Genre matching got following exception and failed:\n {e}\n traceback: \n {t(v).with_traceback(tb)}")
-        return ''
+        t, v, tb = sys.exc_info()
+        logging.debug(f"movie name from table: {movie_name.lower()}\n movies names from title: {[mov['title'].lower() for mov in movies]}")
+        logging.warning(f"Genre matching got following exception and failed:\n {e}\n traceback: \n {t(v).with_traceback(tb)}")
+        return {movie_name: ''}
 
 
 def choose_by_words(movie_name, movies_list):
@@ -134,18 +125,28 @@ def check_existing(movie_name, df_dict):
 
 
 def attach_genre(dfs):
-    ia = imdb.Cinemagoer()
+    cols = ['name', 'country', 'rating', 'date', 'points', 'url', 'genres']
+    genres_list = [f'genre {i}' for i in range(1, 11)]
+    cols = cols + genres_list
     for key, df in dfs.items():
-        df['imdb'] = df['name'].apply(ia.search_movie)[0]
-        df['imdb'] = df['imdb'].apply(ia.get_movie)
-        df['genres'] = df['imdb'].apply(lambda movie: movie.get('genres'))
-        df.drop('imdb', inplace=True)
+        unique_names = df['name'].unique()
+        n_processors = mp.cpu_count()
+        pool = mp.Pool(n_processors)
+        genres = pool.map(find_movie_genre, unique_names)
+        genres_dict = reduce(lambda a, b: a | b, genres)
+        df['genres'] = df['name'].apply(lambda a: genres_dict[a])
+        temp_genre = df.genres.str.split(',', expand=True)
+        for i in range(len(temp_genre.columns), len(genres_list)):
+            temp_genre[i] = None
+        df[genres_list] = temp_genre
+        df.to_csv(f'dataset_top_netflix_{key}_{begin_date}_{end_date}_genres.csv', sep=',', header=True, index=False,
+                  columns=cols)
 
 
 if __name__ == '__main__':
     extractor = UriExtractor(urls=urls)
     res = extractor.run()
     tables = extract_tables(res)
-    # attach_genre(tables)
+    attach_genre(tables)
 
 
